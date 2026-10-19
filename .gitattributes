@@ -1,0 +1,8 @@
+# 统一按 LF 存储，避免 Windows 上 core.autocrlf=true 造成的
+# "检出即全部文件被改写"（本项目文件都是 LF 写的）。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

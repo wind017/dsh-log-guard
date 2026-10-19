@@ -1,0 +1,27 @@
+# ============================================================================
+# dsh-log-guard —— DSH bundle patch（挂载声明）
+# ============================================================================
+# DSH 启动时按 bundle 层栈叠加各插件 patch，本文件把 log-guard 这个 Host 插件
+# 插入 profile 的配置树。id 即 Loader entry id，可用它做定向 config 覆写。
+#
+# 安装：
+#   dsh plugin --profile desktop add link:<本目录绝对路径>
+# 或直接在 plugins 页面安装本地目录。
+#
+# 挂载后想改配置，在 profile 的 cordis.patch.yml 里按 id 覆写，例如：
+#   - id: dsh-log-guard
+#     name: dsh-log-guard
+#     config:
+#       scanIntervalMs: 500
+#       notifySound: true
+# ============================================================================
+
+- insert:
+    - id: dsh-log-guard
+      name: dsh-log-guard
+      config:
+        enabled: true
+        scanIntervalMs: 1000
+        scanExisting: false
+        notifySound: false
+        printToHostConsole: true

@@ -1,0 +1,36 @@
+# 本项目**零运行时依赖**（只用 Node 内置模块），正常情况下不会有 node_modules。
+# 保留这条是为了防止误跑 pnpm/npm install 后把依赖树提交进来。
+node_modules/
+
+# 测试与运行期产物
+*.log
+*.tmp
+alerts.jsonl
+notify.log
+ignored-sessions.json
+unacked-alerts.json
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 依赖锁文件（零依赖项目，防止误跑 pnpm/npm install 后提交）
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# 环境变量与凭据（安全/审计工具，防御式忽略）
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# WorkBuddy 项目数据（记忆 / 每日工作日志，勿提交）
+.workbuddy/
+

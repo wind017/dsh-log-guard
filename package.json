@@ -1,0 +1,31 @@
+{
+  "name": "dsh-log-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Host 插件：实时监听日志文件，检测 cordis_define / cordis_run / subprocess / pwsh 等敏感操作，并以显性告警（系统提示告警块 + 告警文件 + 宿主 stderr）提示用户。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "security",
+    "audit",
+    "log"
+  ],
+  "type": "module",
+  "main": "index.mjs",
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "REFERENCE.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/run-tests.mjs"
+  },
+  "license": "MIT"
+}
