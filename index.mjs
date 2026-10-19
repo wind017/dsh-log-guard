@@ -1324,6 +1324,101 @@ class LogGuard {
   }
 
   /**
+   * 判断一次**即将执行**的工具调用是否命中执行策略（blocker/jammer）。
+   *
+   * 这里匹配的是**工具名**，不是参数文本。
+   * critical 规则（`cordis-define` / `cordis-run`）本身就是工具名，按名字匹配
+   * 零误报；若默认扫参数，"编辑本插件源码"（内容含这些字面量）会被自己拦住。
+   * 需要更严格时用 `enforce.enforceArguments: true` 显式打开。
+   *
+   * @param exec 待执行的调用（`{ name, arguments, callId }`）。
+   * @returns 命中的规则数组；未命中或未启用时为空数组。
+   */
+  enforcementMatches(exec) {
+    const policy = this.config.enforce
+    if (!policy || policy.enabled !== true) return []
+    const name = typeof exec?.name === 'string' ? exec.name : ''
+    if (name === '') return []
+    const wanted = policy.rules
+    const out = []
+    for (const rule of this.rules) {
+      if (!policy.severities.includes(rule.severity)) continue
+      if (wanted.length > 0 && !wanted.includes(rule.id)) continue
+      let hit = rule.tool ? rule.tool === name : false
+      if (!hit && rule.pattern) {
+        rule.pattern.lastIndex = 0
+        hit = rule.pattern.test(name)
+      }
+      if (!hit && policy.enforceArguments && rule.pattern) {
+        const argsText = typeof exec.arguments === 'string' ? exec.arguments : toText(exec.arguments ?? '')
+        rule.pattern.lastIndex = 0
+        hit = rule.pattern.test(argsText)
+      }
+      if (hit) out.push(rule)
+    }
+    return out
+  }
+
+  /**
+   * 记录一次拦截/阻断，并让它进入告警通道（横幅、告警文件、提示音）。
+   *
+   * @param exec 被处理的调用。
+   * @param matched 命中的规则。
+   * @param channel `'blocker'` 或 `'jammer'`。
+   * @param action 具体动作（ask/deny/cancel/block）。
+   */
+  recordEnforcement(exec, matched, channel, action) {
+    const callId = typeof exec?.callId === 'string' ? exec.callId : ''
+    const noun = channel === 'blocker' ? '拦截' : '阻断结果'
+    this.raise(
+      matched.map((rule) => ({
+        severity: rule.severity,
+        ruleId: rule.id,
+        description: `${noun}：${rule.description}`,
+        sources: [`tool:${exec?.name ?? '?'}`],
+        matched: String(exec?.name ?? ''),
+        snippet: `调用 ${exec?.name ?? '?'} 命中 ${rule.id} → ${noun}（${action}）`,
+        // 同一调用同一规则只算一条，避免重复堆叠。
+        fingerprint: hash(`${rule.id}|${exec?.name ?? ''}|${channel}|${callId}`),
+      })),
+    )
+    this.warn(`[${channel}] ${exec?.name ?? '?'} 命中 ${matched.map((r) => r.id).join(',')} → ${action}`)
+  }
+
+  /**
+   * 给模型看的拦截原因（`ask` / `deny` 的 `reason`）。
+   * @param matched 命中的规则。
+   * @param channel 通道。
+   * @returns 单行原因。
+   */
+  enforcementReason(matched, channel = 'blocker') {
+    const ids = matched.map((r) => r.id).join(', ')
+    const label = this.config.enforce?.label ?? 'dsh-log-guard'
+    return channel === 'blocker'
+      ? `${label}：该调用命中敏感操作规则 ${ids}，需要你明确授权才会执行。`
+      : `${label}：该调用的结果已被阻断（命中 ${ids}）。`
+  }
+
+  /**
+   * Jammer 用的结果反馈：模型看到的就是这段文字，而不是真实输出。
+   * @param exec 被阻断的调用。
+   * @param matched 命中的规则。
+   * @returns 反馈文本。
+   */
+  enforcementFeedback(exec, matched) {
+    const label = this.config.enforce?.label ?? 'dsh-log-guard'
+    const lines = [
+      `【${label} 已阻断本次调用的结果】`,
+      `工具：${exec?.name ?? '?'}`,
+      `命中规则：${matched.map((r) => `${r.id}(${r.severity})`).join(', ')}`,
+      '',
+      '该调用可能已经实际执行，但它的输出被策略封存，不会进入你的上下文。',
+      '需要真实结果时，请让用户先确认这条操作，再重试；不要靠猜测补全输出。',
+    ]
+    return lines.join('\n')
+  }
+
+  /**
    * 当前**未确认**的告警（供 `/dsh-log-guard/alerts.json` 轮询）。
    *
    * 与"注入模型上下文"那条通道刻意分开：
@@ -1489,6 +1584,49 @@ class LogGuard {
 // 配置规整
 // ---------------------------------------------------------------------------
 
+/** Blocker 允许的动作。`off` 表示只告警不拦截。 */
+const BLOCKER_ACTIONS = Object.freeze(['ask', 'deny', 'cancel', 'off'])
+/** Jammer 允许的动作。`off` 表示不干预结果。 */
+const JAMMER_ACTIONS = Object.freeze(['block', 'off'])
+
+/**
+ * 规整 `enforce` 配置块（blocker / jammer）。
+ *
+ * **默认关闭**：这是从"检测器"升级为"策略执行器"，默认开启等于擅自改变
+ * 宿主行为；必须由用户在 profile 的 `cordis.patch.yml` 里显式 `enabled: true`。
+ *
+ * @param raw 原始 `enforce` 值。
+ * @returns 规整后的执行策略。
+ */
+function normalizeEnforce(raw) {
+  const input = isObject(raw) ? raw : {}
+  const severities =
+    Array.isArray(input.severities) && input.severities.length > 0
+      ? input.severities.filter((s) => typeof s === 'string' && s !== '')
+      : ['critical']
+  return {
+    enabled: input.enabled === true,
+    /** `ask` = 询问用户后放行（推荐）；`deny` = 直接拒；`cancel` = 静默取消。 */
+    blocker: BLOCKER_ACTIONS.includes(input.blocker) ? input.blocker : 'ask',
+    /** `block` = 阻断结果并给模型一段反馈。 */
+    jammer: JAMMER_ACTIONS.includes(input.jammer) ? input.jammer : 'block',
+    /** 只对这些级别生效；默认仅 critical（即 cordis_define / cordis_run）。 */
+    severities,
+    /** 可选：只对这些规则 id 生效（空 = 由 severities 决定）。 */
+    rules: Array.isArray(input.rules) ? input.rules.filter((r) => typeof r === 'string' && r !== '') : [],
+    /**
+     * 是否连**参数文本**一起匹配。默认 false —— 只匹配工具名。
+     *
+     * 为什么默认不扫参数：critical 规则本身就是工具名（cordis_define / cordis_run），
+     * 按名字匹配零误报；而扫参数会让"用 write 编辑本插件源码"（内容含这些字面量）
+     * 被自己拦住。需要更严格时再显式打开，并接受噪声。
+     */
+    enforceArguments: input.enforceArguments === true,
+    /** 询问框的标题，用于 `displayReason` 与告警文案。 */
+    label: typeof input.label === 'string' && input.label !== '' ? input.label : 'dsh-log-guard',
+  }
+}
+
 /**
  * 把 Loader 传入的原始 config 规整为引擎配置。
  * 所有字段都可省略；非法值回落到默认值，插件绝不因为配置而加载失败。
@@ -1601,6 +1739,8 @@ function normalizeConfig(raw) {
     ignoreSessionIds: Array.isArray(input.ignoreSessionIds)
       ? input.ignoreSessionIds.filter((id) => typeof id === 'string' && id !== '')
       : [],
+    /** blocker / jammer 执行策略（默认关闭）。 */
+    enforce: normalizeEnforce(input.enforce),
     profileDir,
   }
 }
@@ -2092,6 +2232,85 @@ function ensureUiBanner(ctx, guard, config) {
   }
 }
 
+/**
+ * 装配 blocker / jammer。
+ *
+ * - **blocker** 走 `tools/pre-execute` waterfall：返回 `ask` 时宿主会弹审批，
+ *   用户批准才执行；`ask` 在没有审批支持时会被宿主转成拒绝（fail-closed，符合预期）。
+ *   之所以不用 `ctx.tools.guard()`：guard 是**同步**的，无法等待用户，
+ *   而 `deny` 又不可被任何东西放行 —— 用户选的是"询问后放行"，只能走 `ask`。
+ * - **jammer** 走 `tools/post-execute` waterfall：调用已执行，但返回 `block` +
+ *   `feedback`，模型只看到这段反馈，看不到真实输出。
+ *
+ * @param ctx Cordis 根上下文。
+ * @param guard 引擎实例。
+ * @param config 已规整配置。
+ * @returns 实际装了监听器的条数（0 = 未启用或全部 off）。
+ */
+function installEnforcement(ctx, guard, config) {
+  const policy = config.enforce
+  if (!policy || policy.enabled !== true) return 0
+  const label = policy.label
+  let installed = 0
+
+  // 自检：`tools` 服务取不到时，`tools/*` 事件永远不会派发 —— 策略会**静默失效**。
+  // 与其让用户以为开了防护，不如明确警告。
+  let toolsReady = false
+  try {
+    toolsReady = Boolean(ctx.get('tools'))
+  } catch {
+    toolsReady = false
+  }
+  if (!toolsReady) {
+    guard.warn('⚠ 未取到 tools 服务：blocker/jammer 已挂监听器，但可能不会被派发（策略可能静默不生效）。')
+  }
+
+  if (policy.blocker !== 'off') {
+    ctx.effect(() =>
+      ctx.on('tools/pre-execute', async (exec, next) => {
+        const matched = guard.enforcementMatches(exec)
+        // 未命中必须委托下一环 —— 不拥有决策的 waterfall 监听器必须 return next()。
+        if (matched.length === 0) return next()
+        guard.recordEnforcement(exec, matched, 'blocker', policy.blocker)
+        if (policy.blocker === 'deny') {
+          return {
+            kind: 'deny',
+            reason: guard.enforcementReason(matched, 'blocker'),
+            info: { name: exec.name, code: 'LOG_GUARD_BLOCKED' },
+          }
+        }
+        if (policy.blocker === 'cancel') return { kind: 'cancel' }
+        return {
+          kind: 'ask',
+          reason: guard.enforcementReason(matched, 'blocker'),
+          displayReason: {
+            en: `${label}: this call hits sensitive rule(s) ${matched.map((r) => r.id).join(', ')}. Approve to run it.`,
+            zh: `${label}：该调用命中敏感规则 ${matched.map((r) => r.id).join(', ')}，批准后才会执行。`,
+          },
+        }
+      }),
+    )
+    installed++
+  }
+
+  if (policy.jammer !== 'off') {
+    ctx.effect(() =>
+      ctx.on('tools/post-execute', async (exec, result, next) => {
+        const matched = guard.enforcementMatches(exec)
+        if (matched.length === 0) return next()
+        guard.recordEnforcement(exec, matched, 'jammer', policy.jammer)
+        return {
+          kind: 'block',
+          feedback: [{ type: 'text', text: guard.enforcementFeedback(exec, matched) }],
+        }
+      }),
+    )
+    installed++
+  }
+
+  return installed
+}
+
 /** Cordis 插件对象。 */
 const plugin = {
   name: 'dsh-log-guard',
@@ -2122,6 +2341,17 @@ const plugin = {
     // ② 再补挂生命周期钩子：webServer 晚就绪也能补装路由，且不依赖任何业务服务的事件。
     guard.attachLifecycle()
 
+    // ③ blocker / jammer（默认关闭；启用时才挂 tools/* 监听器）。
+    const enforced = installEnforcement(ctx, guard, config)
+    if (enforced > 0) {
+      guard.warn(
+        `执行策略已启用：blocker=${config.enforce.blocker} jammer=${config.enforce.jammer}` +
+          ` 级别=${config.enforce.severities.join('/')}` +
+          `${config.enforce.enforceArguments ? '（含参数匹配）' : '（仅工具名匹配）'}` +
+          `，已挂 ${enforced} 个监听器。`,
+      )
+    }
+
     // ④ 启动轮询。
     guard.start()
 
@@ -2151,6 +2381,8 @@ export default plugin
 export {
   LogGuard,
   normalizeConfig,
+  normalizeEnforce,
+  installEnforcement,
   scanText,
   buildRules,
   decodeZstd,

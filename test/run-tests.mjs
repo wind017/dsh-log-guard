@@ -21,6 +21,8 @@ import assert from 'node:assert/strict'
 import {
   LogGuard,
   normalizeConfig,
+  normalizeEnforce,
+  installEnforcement,
   scanText,
   buildRules,
   decodeZstd,
@@ -1521,6 +1523,177 @@ await testAsync('webServer 晚就绪时也能补装上横幅路由', async () =>
     globalThis.setInterval = realSetInterval
     globalThis.clearInterval = realClearInterval
   }
+})
+
+console.log('\n[6] blocker / jammer（执行策略）')
+
+/** 造一个"待执行调用"。 */
+function fakeCall(name, args = {}, callId = 'call-x') {
+  return { name, arguments: args, callId }
+}
+/** 从 fake ctx 里取出注册的 waterfall 监听器。 */
+function listenerFor(fake, event) {
+  const s = fake.subscriptions.find((x) => x.event === event)
+  return s ? s.listener : null
+}
+
+test('回归：执行策略默认关闭（不擅自改变宿主行为）', () => {
+  const fake = makeFakeCtx()
+  const guard = new LogGuard(fake.ctx, testConfig())
+  assert.equal(guard.config.enforce.enabled, false, 'enforce.enabled 默认 false')
+  assert.equal(installEnforcement(fake.ctx, guard, guard.config), 0, '未启用时应挂 0 个监听器')
+  assert.equal(listenerFor(fake, 'tools/pre-execute'), null, '不应注册 pre-execute')
+  assert.equal(listenerFor(fake, 'tools/post-execute'), null, '不应注册 post-execute')
+  assert.deepEqual(guard.enforcementMatches(fakeCall('cordis_define')), [], '未启用时匹配恒为空')
+})
+
+test('只按工具名匹配 critical（不扫参数）', () => {
+  const fake = makeFakeCtx()
+  const guard = new LogGuard(fake.ctx, testConfig({ enforce: { enabled: true } }))
+  assert.deepEqual(
+    guard.enforcementMatches(fakeCall('cordis_define')).map((r) => r.id),
+    ['cordis-define'],
+  )
+  assert.deepEqual(
+    guard.enforcementMatches(fakeCall('cordis_run')).map((r) => r.id),
+    ['cordis-run'],
+  )
+  // pwsh 是 high，不在默认 severities=['critical'] 内
+  assert.deepEqual(guard.enforcementMatches(fakeCall('pwsh')), [], '非 critical 不拦')
+  // 默认不扫参数：write 内容含 cordis_define 不应命中（否则编辑本插件会被自己拦住）
+  assert.deepEqual(
+    guard.enforcementMatches(fakeCall('write', { content: 'cordis_define 与 cordis_run' })),
+    [],
+    '默认不扫参数，避免误拦写文件',
+  )
+})
+
+test('enforceArguments 打开后才按参数匹配', () => {
+  const fake = makeFakeCtx()
+  const guard = new LogGuard(
+    fake.ctx,
+    testConfig({ enforce: { enabled: true, enforceArguments: true } }),
+  )
+  const hit = guard.enforcementMatches(fakeCall('write', { content: '调用 cordis_define' }))
+  assert.ok(hit.some((r) => r.id === 'cordis-define'), '打开后参数命中应生效')
+})
+
+test('severities / rules 过滤生效', () => {
+  const fake = makeFakeCtx()
+  const highGuard = new LogGuard(fake.ctx, testConfig({ enforce: { enabled: true, severities: ['high'] } }))
+  assert.deepEqual(
+    highGuard.enforcementMatches(fakeCall('pwsh')).map((r) => r.id),
+    ['tool-pwsh'],
+    'severities=high 时应命中 pwsh',
+  )
+  assert.deepEqual(highGuard.enforcementMatches(fakeCall('cordis_define')), [], 'critical 此时不在范围内')
+
+  const onlyOne = new LogGuard(fake.ctx, testConfig({ enforce: { enabled: true, rules: ['cordis-run'] } }))
+  assert.deepEqual(onlyOne.enforcementMatches(fakeCall('cordis_define')), [], 'rules 白名单外不匹配')
+  assert.deepEqual(
+    onlyOne.enforcementMatches(fakeCall('cordis_run')).map((r) => r.id),
+    ['cordis-run'],
+  )
+})
+
+await testAsync('blocker=ask：命中返回 ask 且带中英 displayReason', async () => {
+  const fake = makeFakeCtx()
+  const guard = new LogGuard(fake.ctx, testConfig({ enforce: { enabled: true, blocker: 'ask' } }))
+  const installed = installEnforcement(fake.ctx, guard, guard.config)
+  assert.equal(installed, 2, 'blocker + jammer 各挂一个')
+
+  const listener = listenerFor(fake, 'tools/pre-execute')
+  assert.ok(listener, '应注册 tools/pre-execute')
+
+  let nextCalls = 0
+  const decision = await listener(fakeCall('cordis_define', {}, 'call-ask'), async () => {
+    nextCalls++
+    return { kind: 'allow' }
+  })
+  assert.equal(decision.kind, 'ask', '应返回 ask')
+  assert.ok(decision.reason.includes('cordis-define'), 'reason 应点名规则')
+  assert.equal(typeof decision.displayReason.en, 'string')
+  assert.equal(typeof decision.displayReason.zh, 'string')
+  assert.equal(nextCalls, 0, '命中时不应再委托 next()')
+
+  // 未命中必须委托，否则会吞掉所有其它工具调用
+  const allow = await listener(fakeCall('read', {}, 'call-ok'), async () => {
+    nextCalls++
+    return { kind: 'allow' }
+  })
+  assert.equal(allow.kind, 'allow')
+  assert.equal(nextCalls, 1, '未命中必须调用 next()')
+})
+
+await testAsync('blocker=deny / cancel / off 的行为', async () => {
+  for (const [action, expected] of [
+    ['deny', 'deny'],
+    ['cancel', 'cancel'],
+  ]) {
+    const fake = makeFakeCtx()
+    const guard = new LogGuard(fake.ctx, testConfig({ enforce: { enabled: true, blocker: action } }))
+    installEnforcement(fake.ctx, guard, guard.config)
+    const decision = await listenerFor(fake, 'tools/pre-execute')(
+      fakeCall('cordis_run', {}, 'call-' + action),
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(decision.kind, expected, `blocker=${action} 应返回 ${expected}`)
+  }
+
+  // blocker=off：不应注册 pre-execute，但仍应注册 jammer
+  const fake = makeFakeCtx()
+  const guard = new LogGuard(fake.ctx, testConfig({ enforce: { enabled: true, blocker: 'off' } }))
+  const installed = installEnforcement(fake.ctx, guard, guard.config)
+  assert.equal(installed, 1, '只挂 jammer')
+  assert.equal(listenerFor(fake, 'tools/pre-execute'), null, 'blocker=off 不注册 pre-execute')
+  assert.ok(listenerFor(fake, 'tools/post-execute'), 'jammer 仍应注册')
+})
+
+await testAsync('jammer=block：命中返回 block + feedback，未命中委托', async () => {
+  const fake = makeFakeCtx()
+  const guard = new LogGuard(fake.ctx, testConfig({ enforce: { enabled: true, jammer: 'block' } }))
+  installEnforcement(fake.ctx, guard, guard.config)
+  const listener = listenerFor(fake, 'tools/post-execute')
+  assert.ok(listener, '应注册 tools/post-execute')
+
+  const decision = await listener(
+    fakeCall('cordis_define', {}, 'call-jam'),
+    { isError: false, value: { leaked: 'real-output' }, content: [{ type: 'text', text: '真实输出' }] },
+    async () => ({ kind: 'accept' }),
+  )
+  assert.equal(decision.kind, 'block', '应返回 block')
+  assert.ok(Array.isArray(decision.feedback) && decision.feedback.length > 0, 'feedback 不能为空')
+  assert.equal(decision.feedback[0].type, 'text')
+  assert.ok(decision.feedback[0].text.includes('已阻断'), '反馈应说明已阻断')
+  assert.ok(!decision.feedback[0].text.includes('real-output'), '反馈不得泄漏真实结果')
+
+  // 未命中必须委托
+  let delegated = 0
+  const accept = await listener(fakeCall('read'), { isError: false, value: 1, content: [] }, async () => {
+    delegated++
+    return { kind: 'accept' }
+  })
+  assert.equal(accept.kind, 'accept')
+  assert.equal(delegated, 1, '未命中必须调用 next()')
+})
+
+await testAsync('拦截/阻断会进入告警队列（用户看得见）', async () => {
+  const fake = makeFakeCtx()
+  const guard = new LogGuard(
+    fake.ctx,
+    testConfig({ enforce: { enabled: true, blocker: 'deny', jammer: 'off' }, notifySound: false }),
+  )
+  installEnforcement(fake.ctx, guard, guard.config)
+  const before = guard.unackedList().alerts.length
+  await listenerFor(fake, 'tools/pre-execute')(fakeCall('cordis_define', {}, 'call-alert'), async () => ({
+    kind: 'allow',
+  }))
+  const after = guard.unackedList().alerts
+  assert.ok(after.length > before, '拦截应产生告警')
+  const hit = after.find((a) => a.ruleId === 'cordis-define')
+  assert.ok(hit, '告警里应有 cordis-define')
+  assert.ok(hit.description.includes('拦截'), `描述应标明拦截，实际: ${hit.description}`)
+  assert.deepEqual(hit.sources, ['tool:cordis_define'], '来源应标出是哪个工具')
 })
 
 console.log('\n[5] 规则集概览')

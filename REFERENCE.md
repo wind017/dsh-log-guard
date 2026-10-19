@@ -124,6 +124,61 @@ hardDependency:  inject: ["systemPrompt"]  →  ctx.systemPrompt
 用 `res.writeHead(200, headers)` + `res.end(body)` 响应），返回 disposer。banner.js 由
 `/dsh-log-guard/banner.js` 路由提供，页面脚本轮询 `/dsh-log-guard/alerts.json` 拿告警。
 
+### 2.6 拦截与阻断用的工具管线事件（本地实测）
+
+blocker/jammer 依赖三条 `tools/*` waterfall，契约由 `cordis_inspect_query(provider: "Event")` 读出：
+
+```ts
+// 拦截：可返回 allow / deny / cancel / ask
+'tools/pre-execute'(
+  this: Scoped<ToolRuntime>,
+  exec: ToolExecution,
+  next: () => Promise<PreToolDecision>,
+): Promise<PreToolDecision>
+
+type PreToolDecision =
+  | { kind: 'allow' }
+  | { kind: 'deny'; reason: string; info?: ToolErrorInfo }
+  | { kind: 'cancel' }
+  | { kind: 'ask'; reason?: string; displayReason?: { en: string; [locale: string]: string } }
+```
+
+```ts
+// 执行：包装器**只能替换 exec.signal**，调用身份（名字/参数）不可变
+'tools/execute'(this, exec: ToolDispatchExecution, next): Promise<ToolExecutionResult>
+```
+
+```ts
+// 结果处置：accept / replace / enrich / block
+'tools/post-execute'(
+  this, exec: ToolExecution, result: Readonly<ToolExecutionResult>, next,
+): Promise<PostToolDecision>
+
+type PostToolDecision =
+  | { kind: 'accept'; content?: ContentBlock[]; additionalContexts?: UserMessage[] }
+  | { kind: 'accept'; value: JsonValue; additionalContexts?: UserMessage[] }
+  | { kind: 'block'; feedback: ContentBlock[]; additionalContexts?: UserMessage[] }
+```
+
+配套的 `tools` Service：
+
+```
+guard(guard: ToolGuard): () => void          // 同步、单调；返回字符串即拒
+restrict(filter: ToolRestriction): () => void // 只能隐藏工具
+get(name, scope?): ToolDefinition | undefined
+```
+
+**由此确定的三条设计约束**：
+
+1. **"询问后放行"只能用 `ask`**。`ctx.tools.guard()` 是同步的，无法等待用户；
+   `deny` 又不可覆盖。事件说明还明确：*missing approval support turns `ask` into denial*（fail-closed）。
+2. **参数不可改写**。`tools/execute` 的说明写明 *wrappers may change only `exec.signal`,
+   while call identity remains immutable*，所以"命令消毒"不可行；jammer 只能封存结果。
+3. **未命中必须 `return next()`**。不拥有决策的 waterfall 监听器若吞掉调用，会废掉所有其它工具。
+
+另外 `references/practices.md`（技能自带）给出的选择顺序是：
+`restrict` < `guard` < waterfall。本插件按用户选择落在 waterfall 这一档。
+
 ---
 
 ## 3. 日志格式（本地实测）

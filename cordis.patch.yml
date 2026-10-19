@@ -25,3 +25,19 @@
         scanExisting: false
         notifySound: false
         printToHostConsole: true
+        # —— 拦截与阻断（默认关闭；改 enabled: true 才生效）——
+        # blocker: 命中 critical 规则时如何拦截
+        #   ask    询问用户，批准后放行（默认，fail-closed）
+        #   deny   直接拒绝，无法被覆盖
+        #   cancel 静默取消
+        #   off    不拦截
+        # jammer: 命中后如何处置结果
+        #   block  阻断结果，模型只看到"已阻断"反馈（默认）
+        #   off    不干预
+        enforce:
+          enabled: false
+          blocker: ask
+          jammer: block
+          severities:
+            - critical
+          enforceArguments: false

@@ -109,6 +109,14 @@ dsh plugin --profile web add link:<本目录绝对路径>
     ignoredStateFile: "%USERPROFILE%\\.dsh\\log-guard\\ignored-sessions.json"   # 自身会话 id 持久化；设 null 关闭
     maxPendingAlerts: 20         # 最多挂起多少条未提示告警
     dedupeWindowMs: 60000        # 同一命中的去重窗口
+    # —— 拦截与阻断（默认关闭；开启才会挂 tools/* 监听器）——
+    enforce:
+      enabled: false             # 改成 true 才启用 blocker/jammer
+      blocker: ask               # ask（询问后放行）| deny | cancel | off
+      jammer: block              # block（阻断结果）| off
+      severities: [critical]     # 只对 critical 生效（cordis_define / cordis_run）
+      rules: []                  # 可选：只对这些规则 id 生效
+      enforceArguments: false    # 默认只匹配工具名（避免误拦"写文件内容含敏感词"）
 ```
 
 ### 全部配置字段
@@ -140,6 +148,12 @@ dsh plugin --profile web add link:<本目录绝对路径>
 | `disabledRules` | `[]` | 关掉某些内置规则（填规则 id） |
 | `replaceDefaultRules` | `false` | `true` 时只用 `rules` 里的自定义规则 |
 | `rules` | `[]` | 追加自定义规则（见下） |
+| `enforce.enabled` | `false` | **是否启用 blocker/jammer**（默认关闭，见下文「拦截与阻断」） |
+| `enforce.blocker` | `'ask'` | 拦截方式：`ask`（询问后放行）/ `deny` / `cancel` / `off` |
+| `enforce.jammer` | `'block'` | 结果处置：`block`（阻断结果）/ `off` |
+| `enforce.severities` | `['critical']` | 只对这些级别生效（默认仅 `cordis_define` / `cordis_run`） |
+| `enforce.rules` | `[]` | 只对这些规则 id 生效（空 = 由 severities 决定） |
+| `enforce.enforceArguments` | `false` | 是否连**参数文本**一起匹配（默认只匹配工具名，见下文） |
 
 ### 自定义规则
 
@@ -410,6 +424,71 @@ $DSH_HOME/log-guard/ignored-sessions.json
 文件读失败或损坏一律当作空，不影响启动；不想落盘就设 `ignoredStateFile: null`
 （代价是每次重启重现启动空窗）。
 
+## 拦截与阻断（blocker / jammer）
+
+默认关闭。开启后插件从"检测器"升级为"策略执行器"，改变宿主的实际行为。
+
+| 角色 | 挂载点 | 作用 | 默认 |
+|---|---|---|---|
+| **blocker** | `tools/pre-execute` waterfall | 命中时返回 `ask` → 宿主弹审批，**用户批准才执行** | 开（`ask`） |
+| **jammer** | `tools/post-execute` waterfall | 命中时返回 `block` + feedback → **模型只看到"已阻断"，看不到真实输出** | 开（`block`） |
+
+### 为什么用 `ask` 而不是 `ctx.tools.guard()`
+
+`ctx.tools.guard()` 是**同步**的：它只能返回一个字符串来拒绝，无法等待用户，而且**单调不可覆盖**
+（任何 guard 都能拒，没人能强制放行）。而"询问用户后放行"必须能 await —— 只有
+`tools/pre-execute` 返回 `{ kind: 'ask' }` 才做得到。
+
+> ⚠️ 宿主在没有审批支持时会把 `ask` **转成拒绝**（fail-closed）。这是预期行为：
+> 无人值守场景下宁可拒绝，也不静默放行。
+
+### 为什么默认只按「工具名」匹配
+
+`enforce.enforceArguments` 默认 `false`：只拿**工具名**去匹配规则。
+
+- critical 规则本身就是工具名（`cordis_define` / `cordis_run`），按名字匹配**零误报**；
+- 若默认扫参数，**编辑本插件源码**（`write` 的 content 里就写着 `cordis_define` 这些字面量）
+  会被自己拦住，等于自锁。
+
+需要更严格时显式打开，并接受"写文件内容含敏感词也会被拦"的噪声。
+
+### 为什么不能改写参数
+
+`tools/execute` 的契约写明：**调用身份不可变**，包装器只能替换 `exec.signal`。
+所以"jammer = 消毒命令参数"这条路不成立 —— 可行的只有"执行后把结果封存"。
+这也是本插件选择 `block` + feedback 的原因。
+
+### 一次完整交互长什么样
+
+```
+模型要调用 cordis_define
+  → blocker 返回 ask
+  → 宿主弹出审批：「dsh-log-guard：该调用命中敏感规则 cordis-define，批准后才会执行。」
+  → 用户批准 → 调用执行
+  → jammer 在 post-execute 返回 block
+  → 模型收到：
+      【dsh-log-guard 已阻断本次调用的结果】
+      工具：cordis_define
+      命中规则：cordis-define(critical)
+      该调用可能已经实际执行，但它的输出被策略封存，不会进入你的上下文。
+```
+
+同时这次拦截会**进入告警通道**（横幅、`alerts.jsonl`、提示音），来源标记为 `tool:cordis_define`。
+
+### 开启方式
+
+```yaml
+- id: dsh-log-guard
+  disabled: false
+  config:
+    enforce:
+      enabled: true
+      blocker: ask        # 想硬拦就改 deny（不可放行）
+      jammer: block
+```
+
+改完**需要重启宿主**（宿主 ESM 缓存，见「生效方式」）。
+
 ## 实现要点
 
 - **多帧 zstd**：会话日志是**多帧拼接**的 zstd（实测一份 306KB 的日志有 136 个帧）。
@@ -449,7 +528,8 @@ $DSH_HOME/log-guard/ignored-sessions.json
 ## 自测
 
 ```powershell
-node test/run-tests.mjs         # 65 项主测试
+node test/run-tests.mjs         # 73 项主测试
+node test/enforce-verify.mjs    # 拦截验收：打印 blocker/jammer 的真实决策形态
 node test/routes-verify.mjs     # 路由层验收：直接调 handler 验 /alerts.json、/ack、/history、banner.js
 node test/demo.mjs              # 示例验证：造样本日志，打印四条通道的实际输出
 node test/beep-live.mjs         # 音效验证：假 DOM+假 AudioContext 跑 banner 脚本，断言三声
@@ -461,10 +541,10 @@ node test/real-log-compare.mjs  # 对真实日志对比两种审计面的噪声�
 > 所有验收脚本都通过 `test/_isolation.mjs` 把状态文件重定向到临时目录 ——
 > 否则它们会往你真实的 `~/.dsh/log-guard/` 里写（实测报过 EPERM）。
 
-65 项主测试覆盖：规则匹配、审计面语义、误报回归（结果回显 / 对话文本）、告警渲染、
+73 项主测试覆盖：规则匹配、审计面语义、误报回归（结果回显 / 对话文本）、告警渲染、
 多帧 zstd 解码（拿真实日志当样本）、tail 增量、半行边界、去重、配置回落、
 嵌套目录发现、横幅路由与注入行、生命周期补装与卸载、提示音信号与常驻队列、
-以及针对真实事故的回归：
+blocker/jammer 的决策形态与委托纪律，以及针对真实事故的回归：
 
 | 回归 | 盯死的事故 |
 |---|---|
@@ -481,11 +561,20 @@ node test/real-log-compare.mjs  # 对真实日志对比两种审计面的噪声�
 | **告警常驻展示直到确认** | 旧 `drainAlerts()` 取走即清 → 告警一闪而过、刷新即消失 |
 | **未确认告警跨重启保留** | 状态只在内存里 → 重启后用户还没看到的告警就没了 |
 | 未确认队列有上限 | 无限增长 → 横幅越堆越长 |
+| **默认不启用执行策略** | 检测器擅自变成拦截器会改变宿主行为，必须显式开启 |
+| **只按工具名匹配** | 扫参数会让"编辑本插件源码"被自己拦住（自锁） |
+| **未命中必须委托 `next()`** | 不拥有决策的 waterfall 监听器若吞掉调用，会废掉所有其它工具 |
 
 ## 已知边界
 
-- **它是检测器，不是拦截器。** 命中后告警，但不会阻止操作；轮询间隔内操作可能已执行完。
-  要做到"拦截"需要走 `tools/pre-execute` 这类 waterfall 事件，那是另一个设计。
+- **默认是检测器，不是拦截器。** 未启用 `enforce` 时命中只告警，不阻止操作；
+  轮询间隔内操作可能已执行完。启用 blocker/jammer 后才会真正干预（见「拦截与阻断」）。
+- **`ask` 依赖宿主审批支持。** 没有审批能力时宿主会把 `ask` 转成拒绝（fail-closed）；
+  无人值守场景下这意味着"直接不执行"，而不是"静默放行"。
+- **jammer 不能回滚副作用。** 它只在 `post-execute` 封存结果，调用本身**已经执行过**；
+  文件已写、命令已跑、进程已起都收不回来。要真正阻止必须靠 blocker。
+- **不能改写参数。** `tools/execute` 的契约规定调用身份不可变（只能换 `exec.signal`），
+  所以无法做"命令消毒"。
 - **规则是字面匹配。** 换个写法、拼接字符串、base64 一下就绕过。它挡的是"顺手的危险操作"，
   不是有意的规避。
 - **`scanExisting: false` 是默认值**，即不追诉历史。想审计已有日志就打开它。
