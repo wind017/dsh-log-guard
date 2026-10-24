@@ -20,7 +20,7 @@ import assert from 'node:assert/strict'
 
 import {
   LogGuard,
-  normalizeConfig,
+  normalizeConfig as baseNormalizeConfig,
   normalizeEnforce,
   installEnforcement,
   scanText,
@@ -30,6 +30,41 @@ import {
   takeScanCounters,
   DEFAULT_RULES,
 } from '../index.mjs'
+
+/**
+ * **测试封闭性补丁**：给每个 `normalizeConfig(...)` 调用自动注入隔离的状态文件。
+ *
+ * 为什么必须：`unackedStateFile` / `ignoredStateFile` / `notifyLog` 的默认值落在
+ * 用户真实的 `$DSH_HOME/log-guard/` 下。测试若不显式覆盖，就会读到真实状态 ——
+ * 实测表现为「首次 tick 不应告警」失败（真实未确认队列里还有别的告警），
+ * 且失败数会随真实文件内容变化（同一份代码两次跑出 2 个和 5 个失败）。
+ *
+ * 实现方式：用同名函数遮蔽 import 的 `normalizeConfig`，先铺隔离默认值，
+ * 再让调用方显式传入的字段覆盖它（`{...defaults, ...raw}`）。临时文件名保留
+ * 原名后缀，所以断言默认值（如 `endsWith('alerts.jsonl')`）依然成立。
+ */
+const shadowRoot = mkdtempSync(join(tmpdir(), 'log-guard-shadow-'))
+let shadowSeq = 0
+function shadowState() {
+  const dir = join(shadowRoot, `s${++shadowSeq}`)
+  mkdirSync(dir, { recursive: true })
+  return {
+    alertFile: join(dir, 'alerts.jsonl'),
+    notifyLog: join(dir, 'notify.log'),
+    ignoredStateFile: join(dir, 'ignored-sessions.json'),
+    unackedStateFile: join(dir, 'unacked-alerts.json'),
+  }
+}
+function normalizeConfig(raw) {
+  return baseNormalizeConfig({ ...shadowState(), ...(raw ?? {}) })
+}
+process.on('exit', () => {
+  try {
+    rmSync(shadowRoot, { recursive: true, force: true })
+  } catch {
+    /* 清理失败不影响测试结论 */
+  }
+})
 
 let passed = 0
 let failed = 0
