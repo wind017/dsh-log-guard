@@ -1,5 +1,7 @@
 # dsh-log-guard
 
+> 自用 轻量级日志监听插件 监听日志 拦截敏感操作
+
 DSH（DeepSeek Harness）Host 插件：**实时监听日志文件，检测敏感操作并显性告警。**
 
 监听日志出现新内容时扫描其中的敏感操作 —— `cordis_define` / `cordis_run` /
